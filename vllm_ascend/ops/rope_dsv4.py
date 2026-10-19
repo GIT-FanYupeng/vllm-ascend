@@ -1,4 +1,5 @@
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import torch
@@ -46,6 +47,29 @@ class RopeDataProxy:
                 new_data[config_key][group_name] = (cos_t, sin_t)
         return RopeDataProxy(new_data, is_cos=(self.idx == 0))
 
+    def copy_to_buffers(
+        self,
+        buffers: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor]],
+        capacity: int,
+    ) -> tuple["RopeDataProxy", "RopeDataProxy"]:
+        """Copy cos/sin into caller-owned buffers and return proxies viewing them.
+
+        FULL graphs replay captured addresses, so RoPE data built into fresh
+        tensors must be staged in storage that outlives the step. Missing
+        buffers are allocated with room for ``capacity`` tokens.
+        """
+        new_data: dict = {}
+        for config_key, groups in self._data.items():
+            new_data[config_key] = {}
+            for group_name, rope in groups.items():
+                key = (config_key, group_name)
+                if key not in buffers:
+                    buffers[key] = tuple(t.new_empty((capacity, *t.shape[1:])) for t in rope)
+                new_data[config_key][group_name] = tuple(
+                    buffer[: t.shape[0]].copy_(t) for buffer, t in zip(buffers[key], rope, strict=True)
+                )
+        return RopeDataProxy(new_data, is_cos=True), RopeDataProxy(new_data, is_cos=False)
+
     def __getitem__(self, index):
         if not isinstance(index, str):
             new_map: dict = {}
@@ -84,15 +108,30 @@ def get_cos_and_sin_dsa(
     positions: torch.Tensor | dict[str, torch.Tensor],
     use_cache: bool = False,
     draft_index: int | None = None,
+    layer_names: str | Iterable[str] | None = None,
 ):
     if isinstance(positions, torch.Tensor):
         pos_map = {"default": positions}
     else:
         pos_map = positions
 
+    requested_configs: set[str] | None = None
+    if layer_names is not None:
+        names = [layer_names] if isinstance(layer_names, str) else list(layer_names)
+        requested_configs = set()
+        for layer_name in names:
+            info = _ROPE_STATE.layer_info.get(layer_name)
+            if info is None and layer_name.endswith(".swa_cache"):
+                info = _ROPE_STATE.layer_info.get(f"{layer_name.removesuffix('.swa_cache')}.attn")
+            if info is None:
+                raise KeyError(f"Layer {layer_name} not registered.")
+            requested_configs.add(info[0])
+
     batch_result: dict[Any, Any] = {}
 
     for config_key, registered_groups in _ROPE_STATE.registry_summary.items():
+        if requested_configs is not None and config_key not in requested_configs:
+            continue
         if config_key not in _ROPE_STATE.full_rope_cache:
             continue
         full_rope_cos, full_rope_sin = _ROPE_STATE.full_rope_cache[config_key]

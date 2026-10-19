@@ -25,7 +25,12 @@ def indexer_name(index):
     return f"model.layers.{index}.self_attn.indexer.k_cache"
 
 
-def make_kvpp_config(tp=3):
+def make_kvpp_config(tp=3, pcp=1):
+    speculative_config = SimpleNamespace(
+        method="mtp",
+        num_speculative_tokens_per_batch_size=None,
+    )
+    speculative_config.use_eagle = lambda: speculative_config.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
     return SimpleNamespace(
         use_v2_model_runner=False,
         compilation_config=SimpleNamespace(
@@ -37,7 +42,7 @@ def make_kvpp_config(tp=3):
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp,
             pipeline_parallel_size=1,
-            prefill_context_parallel_size=1,
+            prefill_context_parallel_size=pcp,
             decode_context_parallel_size=1,
         ),
         model_config=SimpleNamespace(
@@ -46,7 +51,7 @@ def make_kvpp_config(tp=3):
             use_mla=True,
             is_hybrid=False,
         ),
-        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens_per_batch_size=None),
+        speculative_config=speculative_config,
         kv_transfer_config=None,
         quant_config=None,
         cache_config=SimpleNamespace(cache_dtype="auto"),
